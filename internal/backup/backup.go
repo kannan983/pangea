@@ -147,7 +147,7 @@ func Restore(src, pass, dir string) (moved string, err error) {
 		return "", err
 	}
 
-	if _, err := os.Stat(dir); err == nil {
+	if hasData(dir) {
 		moved = dir + ".bak-" + time.Now().Format("20060102-150405")
 		if err := os.Rename(dir, moved); err != nil {
 			return "", err
@@ -186,6 +186,16 @@ func Restore(src, pass, dir string) (moved string, err error) {
 	}
 	v.Replace(pw)
 	return moved, v.Save()
+}
+
+// hasData reports whether dir holds a config worth keeping (not just a log).
+func hasData(dir string) bool {
+	for _, f := range []string{"hosts.json", "settings.json", "vault.bin", "known_hosts"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func untar(archive []byte) (map[string][]byte, error) {

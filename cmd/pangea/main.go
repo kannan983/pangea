@@ -8,12 +8,15 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"runtime"
 
 	tea "charm.land/bubbletea/v2"
 	"golang.org/x/term"
 
 	"github.com/kannan983/pangea/internal/backup"
+	"github.com/kannan983/pangea/internal/logx"
 	"github.com/kannan983/pangea/internal/store"
 	"github.com/kannan983/pangea/internal/tui"
 	"github.com/kannan983/pangea/internal/vault"
@@ -30,6 +33,15 @@ func run(args []string) error {
 	dir, err := store.Dir()
 	if err != nil {
 		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if f, path, err := logx.Init(dir); err == nil {
+		defer f.Close()
+		slog.Info("pangea start", "os", runtime.GOOS, "arch", runtime.GOARCH, "pid", os.Getpid(),
+			"args", len(args), "log", path)
+		defer slog.Info("pangea exit")
 	}
 	if len(args) > 0 {
 		if len(args) != 2 || (args[0] != "backup" && args[0] != "restore") {
@@ -48,10 +60,15 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	if warn != "" {
+		slog.Warn("vault", "warning", warn)
+	}
 	m := tui.New(st, v, warn)
 	p := tea.NewProgram(m)
 	m.SetProgram(p)
-	_, err = p.Run()
+	if _, err = p.Run(); err != nil {
+		slog.Error("ui stopped", "err", err)
+	}
 	return err
 }
 
@@ -83,6 +100,7 @@ func runBackup(dir, file string) error {
 		return errors.New("passphrases do not match")
 	}
 	n, err := backup.Create(file, p1, st, v)
+	slog.Info("backup", "file", file, "hosts", len(st.Hosts), "keys", n, "err", err)
 	if err != nil {
 		return err
 	}
@@ -96,6 +114,7 @@ func runRestore(dir, file string) error {
 		return err
 	}
 	moved, err := backup.Restore(file, pass, dir)
+	slog.Info("restore", "file", file, "moved_aside", moved, "err", err)
 	if err != nil {
 		return err
 	}

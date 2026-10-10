@@ -1,10 +1,11 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"os"
 	"path"
@@ -20,45 +21,53 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/kannan983/pangea/internal/fsx"
 	"github.com/kannan983/pangea/internal/store"
 )
 
+// fpane is one side of an SFTP tab: this computer or any server.
 type fpane struct {
+	fs      fsx.FS
 	remote  bool
+	label   string       // "Local" or the host's label
+	home    string       // shown as ~
+	conn    *ssh.Client  // remote panes
+	sc      *sftp.Client // remote panes
+	hostID  string
 	dir     string
 	entries []fs.FileInfo
 	sel     int
 	top     int
 }
 
-func (p *fpane) join(name string) string {
-	if p.remote {
-		return path.Join(p.dir, name)
-	}
-	return filepath.Join(p.dir, name)
+type transfer struct {
+	name, from, to     string
+	fromLabel, toLabel string // "Local" or host labels, for the history
+	fromDir, toDir     string // folders as shown (with ~)
+	toPane             int
+	toFS               fsx.FS // to jump there from the history, if the pane still shows it
+	fromFS             fsx.FS
+	folder             bool
+	total              atomic.Int64 // bytes; filled in by the worker for folders
+	pr                 fsx.Progress
+	start              time.Time
+	finished           time.Duration
+	err                error
+	cancel             context.CancelFunc
 }
 
-type transfer struct {
-	name     string
-	total    int64
-	done     atomic.Int64
-	start    time.Time
-	finished time.Duration
-	err      error
-}
+func (t *transfer) running() bool { return t.finished == 0 }
 
 type sftpView struct {
-	sc        *sftp.Client
-	conn      *ssh.Client
-	label     string
 	panes     [2]*fpane
 	active    int
-	transfers []*transfer
+	transfers []*transfer // this tab's history, newest last
 	ticking   bool
 	drag      *fs.FileInfo
 	dragFrom  int
 	edit      *pathEdit // path bar being typed into
-	homes     [2]string // local and remote home, shown as ~
+	hist      bool      // history panel open
+	histSel   int
 }
 
 type pathEdit struct {
@@ -68,9 +77,26 @@ type pathEdit struct {
 
 type sftpTickMsg struct{ v *sftpView }
 type transferDoneMsg struct {
-	v *sftpView
-	t *transfer
+	v    *sftpView
+	t    *transfer
+	to   string // destination actually used (keep both renames)
+	err  error
+	took time.Duration
 }
+type opDoneMsg struct {
+	v    *sftpView
+	what string
+	err  error
+}
+
+func (p *fpane) cur() fs.FileInfo {
+	if p.sel < len(p.entries) {
+		return p.entries[p.sel]
+	}
+	return nil
+}
+
+// ---- opening ----
 
 // openSFTP opens an SFTP tab for h.
 func (m *Model) openSFTP(h store.Host) tea.Cmd {
@@ -85,7 +111,7 @@ func (m *Model) openSFTPFor(term *tab) tea.Cmd {
 	m.addTab(t)
 	if term.state == stReady {
 		t.state = stConnecting
-		c := term.sess.Client
+		c := term.pane().sess.Client
 		return func() tea.Msg { return dialedMsg{t: t, c: c} }
 	}
 	return m.openSFTPIn(t)
@@ -97,7 +123,7 @@ func (m *Model) openSFTPIn(t *tab) tea.Cmd {
 	t.state, t.err = stConnecting, nil
 	for _, o := range m.tabs {
 		if o.kind == tabTerm && o.state == stReady && o.host.ID != "" && o.host.ID == t.host.ID {
-			c := o.sess.Client
+			c := o.panes[0].sess.Client
 			return func() tea.Msg { return dialedMsg{t: t, c: c} }
 		}
 	}
@@ -105,67 +131,340 @@ func (m *Model) openSFTPIn(t *tab) tea.Cmd {
 }
 
 func (m *Model) startSFTP(t *tab, c *ssh.Client) tea.Cmd {
-	sc, err := sftp.NewClient(c, sftp.UseConcurrentWrites(true), sftp.UseConcurrentReads(true))
-	if err != nil {
-		t.state, t.err = stFailed, err
-		m.release(c)
-		return nil
-	}
 	local := t.host.LocalDir
 	if local == "" {
 		local = m.st.Settings.LocalDir
 	}
-	v, warn, err := newSFTPView(sc, c, t.host.Label, local, t.host.RemoteDir)
+	lp, warn1 := localPane(local)
+	rp, warn2, err := remotePane(c, t.host)
 	if err != nil {
-		sc.Close()
 		t.state, t.err = stFailed, err
 		m.release(c)
 		return nil
 	}
-	t.sftp, t.state = v, stReady
-	if warn != "" {
-		m.fail(errors.New(warn))
+	t.sftp, t.state = &sftpView{panes: [2]*fpane{lp, rp}}, stReady
+	slog.Info("sftp open", "host", t.host.Label, "local", lp.dir, "remote", rp.dir)
+	if w := strings.Trim(warn1+"; "+warn2, "; "); w != "" {
+		m.fail(errors.New(w))
 	}
 	return nil
 }
 
-// newSFTPView opens both panes at their start folders, falling back to the
-// home folders (warn says why) when a configured folder can't be opened.
-func newSFTPView(sc *sftp.Client, conn *ssh.Client, label, localDir, remoteDir string) (*sftpView, string, error) {
+// localPane opens this computer at dir (or home; warn says why).
+func localPane(dir string) (*fpane, string) {
 	home, _ := os.UserHomeDir()
-	rhome, err := sc.Getwd()
+	p := &fpane{fs: fsx.Local{}, label: "Local", home: home, dir: home}
+	warn := ""
+	if dir != "" {
+		p.dir = store.ExpandHome(dir)
+		if err := p.load(); err != nil {
+			warn, p.dir = "local folder "+dir+": "+err.Error(), home
+		}
+	}
+	if err := p.load(); err != nil {
+		warn = err.Error()
+	}
+	return p, warn
+}
+
+// remotePane opens an SFTP session on c at h's start folder (or home).
+func remotePane(c *ssh.Client, h store.Host) (*fpane, string, error) {
+	sc, err := sftp.NewClient(c, sftp.UseConcurrentWrites(true), sftp.UseConcurrentReads(true))
 	if err != nil {
 		return nil, "", err
 	}
-	v := &sftpView{sc: sc, conn: conn, label: label, homes: [2]string{home, rhome},
-		panes: [2]*fpane{{dir: home}, {remote: true, dir: rhome}}}
-	var warns []string
-	if localDir != "" {
-		v.panes[0].dir = store.ExpandHome(localDir)
-		if err := v.load(v.panes[0]); err != nil {
-			warns = append(warns, "local folder "+localDir+": "+err.Error())
-			v.panes[0].dir = home
-		}
-	}
-	if remoteDir != "" {
-		v.panes[1].dir = v.remoteExpand(remoteDir, rhome)
-		if err := v.load(v.panes[1]); err != nil {
-			warns = append(warns, "remote folder "+remoteDir+": "+err.Error())
-			v.panes[1].dir = rhome
-		}
-	}
-	if err := v.load(v.panes[0]); err != nil {
+	home, err := sc.Getwd()
+	if err != nil {
+		sc.Close()
 		return nil, "", err
 	}
-	return v, strings.Join(warns, "; "), v.load(v.panes[1])
+	p := &fpane{fs: fsx.Remote{C: sc}, remote: true, label: h.Label, home: home, dir: home,
+		conn: c, sc: sc, hostID: h.ID}
+	warn := ""
+	if h.RemoteDir != "" {
+		p.dir = expandTilde(h.RemoteDir, home)
+		if err := p.load(); err != nil {
+			warn, p.dir = "remote folder "+h.RemoteDir+": "+err.Error(), home
+		}
+	}
+	if err := p.load(); err != nil {
+		sc.Close()
+		return nil, "", err
+	}
+	return p, warn, nil
 }
 
-// remoteExpand resolves ~ against the remote home.
-func (v *sftpView) remoteExpand(p, home string) string {
+// expandTilde resolves ~ against a remote home.
+func expandTilde(p, home string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {
 		return path.Join(home, p[1:])
 	}
 	return p
+}
+
+// close ends a remote pane's SFTP session (not the SSH connection).
+func (p *fpane) close() {
+	if p.sc != nil {
+		p.sc.Close()
+	}
+}
+
+func (v *sftpView) fsOf(p *fpane) fsx.FS { return p.fs }
+
+func (v *sftpView) load(p *fpane) error { return p.load() }
+
+func (p *fpane) load() error {
+	ents, err := p.fs.ReadDir(p.dir)
+	if err != nil {
+		return err
+	}
+	// Names a server sends are shown but never trusted as paths.
+	ents = slicesFilter(ents, func(e fs.FileInfo) bool { return fsx.SafeName(e.Name()) })
+	sort.Slice(ents, func(i, j int) bool {
+		if ents[i].IsDir() != ents[j].IsDir() {
+			return ents[i].IsDir()
+		}
+		return strings.ToLower(ents[i].Name()) < strings.ToLower(ents[j].Name())
+	})
+	p.entries = ents
+	p.sel = max(0, min(p.sel, len(ents)-1))
+	return nil
+}
+
+func slicesFilter[T any](s []T, keep func(T) bool) []T {
+	out := s[:0]
+	for _, x := range s {
+		if keep(x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func (m *Model) reload(v *sftpView) {
+	for _, p := range v.panes {
+		if err := v.load(p); err != nil {
+			m.fail(err)
+		}
+	}
+}
+
+// ---- transfers ----
+
+func (v *sftpView) tick() tea.Cmd {
+	if v.ticking {
+		return nil
+	}
+	v.ticking = true
+	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return sftpTickMsg{v} })
+}
+
+func (m *Model) sftpTick(v *sftpView) tea.Cmd {
+	v.ticking = false
+	for _, t := range v.transfers {
+		if t.running() {
+			return v.tick()
+		}
+	}
+	return nil
+}
+
+// transferDone records a finished transfer. Only the UI loop writes these
+// fields, so the view never races the worker.
+func (m *Model) transferDone(msg transferDoneMsg) {
+	t := msg.t
+	t.to, t.err, t.finished = msg.to, msg.err, max(msg.took, time.Nanosecond)
+	switch {
+	case errors.Is(t.err, context.Canceled):
+		m.info(t.name + ": canceled")
+	case t.err != nil:
+		m.fail(fmt.Errorf("%s: %w", t.name, t.err))
+	case t.pr.Skipped.Load() > 0:
+		m.info(fmt.Sprintf("%s: done, %d link(s)/special file(s) skipped", t.name, t.pr.Skipped.Load()))
+	}
+	slog.Info("transfer done", "name", t.name, "from", t.fromLabel+":"+t.from, "to", t.toLabel+":"+t.to,
+		"bytes", t.pr.Bytes.Load(), "files", t.pr.Files.Load(), "took", t.finished, "err", t.err)
+	m.reload(msg.v)
+}
+
+// copyTo copies srcPath from side `from` (0 local, 1 remote) into the
+// other pane's folder, asking first if the name is taken there.
+func (m *Model) copyTo(v *sftpView, from int, srcPath string) tea.Cmd {
+	sp := v.panes[from]
+	return m.copyInto(v, sp.fs, sp.label, sp.home, srcPath, 1-from)
+}
+
+// copyInto copies srcPath (on sf) into pane `to`'s folder, asking first if
+// the name is taken there. Works for any pair: local, server, server.
+func (m *Model) copyInto(v *sftpView, sf fsx.FS, srcLabel, srcHome, srcPath string, to int) tea.Cmd {
+	dp := v.panes[to]
+	df := dp.fs
+	name := sf.Base(srcPath)
+	if !fsx.SafeName(name) {
+		m.fail(fmt.Errorf("%q can't be copied", name))
+		return nil
+	}
+	dst := df.Join(dp.dir, name)
+	if _, err := df.Lstat(dst); err == nil {
+		return m.askChoice("File exists", fmt.Sprintf("%s already exists on %s.\nFolders are merged when overwriting.", name, dp.label),
+			[]choice{{"o", "overwrite"}, {"k", "keep both"}, {"s", "skip"}}, func(key string) tea.Cmd {
+				switch key {
+				case "o":
+					return m.runCopy(v, sf, srcLabel, srcHome, srcPath, to, dst, fsx.Overwrite)
+				case "k":
+					return m.runCopy(v, sf, srcLabel, srcHome, srcPath, to, dst, fsx.KeepBoth)
+				}
+				return nil
+			})
+	}
+	return m.runCopy(v, sf, srcLabel, srcHome, srcPath, to, dst, fsx.Overwrite)
+}
+
+func (m *Model) runCopy(v *sftpView, sf fsx.FS, srcLabel, srcHome, src string, to int, dst string, c fsx.Conflict) tea.Cmd {
+	ctx, cancel := context.WithCancel(context.Background())
+	dp := v.panes[to]
+	df := dp.fs
+	t := &transfer{name: sf.Base(src), from: src, to: dst, fromLabel: srcLabel, toLabel: dp.label,
+		fromDir: tildify(sf.Dir(src), srcHome), toDir: tildify(dp.dir, dp.home),
+		toPane: to, toFS: df, fromFS: sf, start: time.Now(), cancel: cancel}
+	if fi, err := sf.Lstat(src); err == nil {
+		t.folder = fi.IsDir()
+		t.total.Store(fi.Size())
+	}
+	v.transfers = append(v.transfers, t)
+	slog.Info("transfer start", "name", t.name, "from", srcLabel+":"+src, "to", dp.label+":"+dst, "folder", t.folder)
+	run := func() tea.Msg {
+		if t.folder {
+			if n, _, err := fsx.Size(sf, src); err == nil {
+				t.total.Store(n)
+			}
+		}
+		final, err := fsx.Copy(ctx, sf, src, df, dst, c, &t.pr)
+		cancel()
+		return transferDoneMsg{v, t, final, err, time.Since(t.start)}
+	}
+	return tea.Batch(run, v.tick())
+}
+
+// dropTarget is where files dropped from the desktop go: the remote pane,
+// or the active one when both (or neither) are remote.
+func dropTarget(v *sftpView) int {
+	if v.panes[0].remote != v.panes[1].remote {
+		if v.panes[0].remote {
+			return 0
+		}
+		return 1
+	}
+	return v.active
+}
+
+// cancelNewest stops the most recently started running transfer.
+func (m *Model) cancelNewest(v *sftpView) {
+	for i := len(v.transfers) - 1; i >= 0; i-- {
+		if t := v.transfers[i]; t.running() {
+			t.cancel()
+			return
+		}
+	}
+	m.info("no transfer running")
+}
+
+// ---- file operations ----
+
+func (m *Model) fileOp(v *sftpView, what string, fn func() error) tea.Cmd {
+	return func() tea.Msg {
+		err := fn()
+		slog.Info("file op", "op", what, "err", err)
+		return opDoneMsg{v, what, err}
+	}
+}
+
+func (m *Model) opDone(msg opDoneMsg) {
+	if msg.err != nil {
+		m.fail(fmt.Errorf("%s: %w", msg.what, msg.err))
+	} else {
+		m.info(msg.what)
+	}
+	m.reload(msg.v)
+}
+
+func (m *Model) renamePrompt(v *sftpView, p *fpane) tea.Cmd {
+	e := p.cur()
+	if e == nil {
+		return nil
+	}
+	f, old := v.fsOf(p), e.Name()
+	return m.askText("Rename", "New name for "+old, old, func(name string) tea.Cmd {
+		name = strings.TrimSpace(name)
+		if name == old {
+			return nil
+		}
+		if err := fsx.ValidNewName(name); err != nil {
+			m.fail(err)
+			return nil
+		}
+		return m.fileOp(v, "Renamed "+old+" to "+name, func() error {
+			return f.Rename(f.Join(p.dir, old), f.Join(p.dir, name))
+		})
+	})
+}
+
+func (m *Model) mkdirPrompt(v *sftpView, p *fpane) tea.Cmd {
+	f := v.fsOf(p)
+	return m.askText("New folder", "Folder name in "+tildify(p.dir, p.home), "", func(name string) tea.Cmd {
+		name = strings.TrimSpace(name)
+		if err := fsx.ValidNewName(name); err != nil {
+			m.fail(err)
+			return nil
+		}
+		return m.fileOp(v, "Created folder "+name, func() error { return f.Mkdir(f.Join(p.dir, name)) })
+	})
+}
+
+func (m *Model) deletePrompt(v *sftpView, p *fpane) tea.Cmd {
+	e := p.cur()
+	if e == nil {
+		return nil
+	}
+	f, name := v.fsOf(p), e.Name()
+	full := f.Join(p.dir, name)
+	what := "Delete file " + name + "?"
+	if e.IsDir() {
+		what = "Delete folder " + name + " and everything in it?"
+	}
+	where := "on this computer"
+	if p.remote {
+		where = "on " + p.label
+	}
+	return m.askConfirm("Delete", what+"\n"+full+" "+where+"\nThis can't be undone.", func() tea.Cmd {
+		return m.fileOp(v, "Deleted "+name, func() error { return fsx.RemoveAll(f, full) })
+	})
+}
+
+func (m *Model) chmodPrompt(v *sftpView, p *fpane) tea.Cmd {
+	e := p.cur()
+	if e == nil {
+		return nil
+	}
+	f, name := v.fsOf(p), e.Name()
+	return m.askText("Permissions", fmt.Sprintf("Octal permissions for %s (now %s, %s)", name, fsx.Octal(e.Mode()), e.Mode().Perm()),
+		fsx.Octal(e.Mode()), func(s string) tea.Cmd {
+			mode, err := fsx.ParseMode(s)
+			if err != nil {
+				m.fail(err)
+				return nil
+			}
+			return m.fileOp(v, fmt.Sprintf("Set %s to %s", name, fsx.Octal(mode)), func() error {
+				return f.Chmod(f.Join(p.dir, name), mode)
+			})
+		})
+}
+
+func (v *sftpView) side(p *fpane) int {
+	if p.remote {
+		return 1
+	}
+	return 0
 }
 
 // ---- path bar ----
@@ -196,11 +495,7 @@ func (v *sftpView) sep(p *fpane) string {
 func (v *sftpView) resolve(p *fpane, typed string) (string, error) {
 	if p.remote {
 		if strings.HasPrefix(typed, "~") {
-			home, err := v.sc.Getwd()
-			if err != nil {
-				return "", err
-			}
-			typed = v.remoteExpand(typed, home)
+			typed = expandTilde(typed, p.home)
 		}
 		if !path.IsAbs(typed) {
 			typed = path.Join(p.dir, typed)
@@ -212,20 +507,6 @@ func (v *sftpView) resolve(p *fpane, typed string) (string, error) {
 		typed = filepath.Join(p.dir, typed)
 	}
 	return filepath.Clean(typed), nil
-}
-
-func (v *sftpView) readDir(p *fpane, dir string) ([]fs.FileInfo, error) {
-	if p.remote {
-		return v.sc.ReadDir(dir)
-	}
-	des, err := os.ReadDir(dir)
-	var out []fs.FileInfo
-	for _, d := range des {
-		if fi, e := d.Info(); e == nil {
-			out = append(out, fi)
-		}
-	}
-	return out, err
 }
 
 // complete fills in folder names after the last separator, like a shell:
@@ -246,7 +527,7 @@ func (m *Model) complete(v *sftpView) {
 		m.fail(err)
 		return
 	}
-	ents, err := v.readDir(p, dir)
+	ents, err := v.fsOf(p).ReadDir(dir)
 	if err != nil {
 		m.fail(err)
 		return
@@ -259,7 +540,7 @@ func (m *Model) complete(v *sftpView) {
 			if fold {
 				ok = strings.HasPrefix(strings.ToLower(n), strings.ToLower(prefix))
 			}
-			if en.IsDir() && ok && !(strings.HasPrefix(n, ".") && !strings.HasPrefix(prefix, ".")) {
+			if en.IsDir() && fsx.SafeName(n) && ok && !(strings.HasPrefix(n, ".") && !strings.HasPrefix(prefix, ".")) {
 				names = append(names, n)
 			}
 		}
@@ -327,149 +608,6 @@ func (m *Model) editKey(v *sftpView, k tea.KeyPressMsg) tea.Cmd {
 	return cmd
 }
 
-func (v *sftpView) load(p *fpane) error {
-	var ents []fs.FileInfo
-	var err error
-	if p.remote {
-		ents, err = v.sc.ReadDir(p.dir)
-	} else {
-		var des []os.DirEntry
-		des, err = os.ReadDir(p.dir)
-		for _, d := range des {
-			if fi, e := d.Info(); e == nil {
-				ents = append(ents, fi)
-			}
-		}
-	}
-	if err != nil {
-		return err
-	}
-	sort.Slice(ents, func(i, j int) bool {
-		if ents[i].IsDir() != ents[j].IsDir() {
-			return ents[i].IsDir()
-		}
-		return strings.ToLower(ents[i].Name()) < strings.ToLower(ents[j].Name())
-	})
-	p.entries = ents
-	p.sel = min(p.sel, max(0, len(ents)-1))
-	return nil
-}
-
-func (v *sftpView) tick() tea.Cmd {
-	if v.ticking {
-		return nil
-	}
-	v.ticking = true
-	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return sftpTickMsg{v} })
-}
-
-func (v *sftpView) exists(remote bool, p string) bool {
-	var err error
-	if remote {
-		_, err = v.sc.Stat(p)
-	} else {
-		_, err = os.Stat(p)
-	}
-	return err == nil
-}
-
-// copyFile copies srcPath into the directory of the other side. upload is
-// local→remote. Existing destination files are never overwritten.
-func (m *Model) copyFile(v *sftpView, upload bool, srcPath string) tea.Cmd {
-	dst := v.panes[0]
-	if upload {
-		dst = v.panes[1]
-	}
-	name := filepath.Base(srcPath)
-	if !upload {
-		name = path.Base(srcPath)
-	}
-	dstPath := dst.join(name)
-	if v.exists(dst.remote, dstPath) {
-		m.fail(fmt.Errorf("%s already exists in %s — not overwriting", name, dst.dir))
-		return nil
-	}
-	var fi fs.FileInfo
-	var err error
-	if upload {
-		fi, err = os.Stat(srcPath)
-	} else {
-		fi, err = v.sc.Stat(srcPath)
-	}
-	if err != nil {
-		m.fail(err)
-		return nil
-	}
-	if !fi.Mode().IsRegular() {
-		m.fail(fmt.Errorf("%s: only regular files can be copied for now", name))
-		return nil
-	}
-	t := &transfer{name: name, total: fi.Size(), start: time.Now()}
-	v.transfers = append(v.transfers, t)
-	run := func() tea.Msg {
-		t.err = v.transfer(upload, srcPath, dstPath, t)
-		t.finished = time.Since(t.start)
-		return transferDoneMsg{v, t}
-	}
-	return tea.Batch(run, v.tick())
-}
-
-func (v *sftpView) transfer(upload bool, src, dst string, t *transfer) error {
-	if upload {
-		lf, err := os.Open(src)
-		if err != nil {
-			return err
-		}
-		defer lf.Close()
-		rf, err := v.sc.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
-		if err != nil {
-			return err
-		}
-		// The size lets ReadFrom pipeline writes (about 3x faster).
-		if _, err := rf.ReadFrom(&io.LimitedReader{R: &counter{lf, &t.done}, N: t.total}); err != nil {
-			rf.Close()
-			return err
-		}
-		return rf.Close()
-	}
-	rf, err := v.sc.Open(src)
-	if err != nil {
-		return err
-	}
-	defer rf.Close()
-	lf, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := rf.WriteTo(&counterW{lf, &t.done}); err != nil {
-		lf.Close()
-		return err
-	}
-	return lf.Close()
-}
-
-type counter struct {
-	r io.Reader
-	n *atomic.Int64
-}
-
-func (c *counter) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n.Add(int64(n))
-	return n, err
-}
-
-type counterW struct {
-	w io.Writer
-	n *atomic.Int64
-}
-
-func (c *counterW) Write(p []byte) (int, error) {
-	n, err := c.w.Write(p)
-	c.n.Add(int64(n))
-	return n, err
-}
-
 // splitDropped parses what terminals paste when files are dropped on them:
 // space separated paths with backslash-escaped spaces, quoted paths, one
 // per line, or file:// URIs.
@@ -512,26 +650,7 @@ func splitDropped(s string) []string {
 	return out
 }
 
-func (m *Model) sftpTick(v *sftpView) tea.Cmd {
-	v.ticking = false
-	for _, t := range v.transfers {
-		if t.finished == 0 {
-			return v.tick()
-		}
-	}
-	return nil
-}
-
-func (m *Model) transferDone(msg transferDoneMsg) {
-	if msg.t.err != nil {
-		m.fail(fmt.Errorf("%s: %w", msg.t.name, msg.t.err))
-	}
-	for _, p := range msg.v.panes {
-		if err := msg.v.load(p); err != nil {
-			m.fail(err)
-		}
-	}
-}
+// ---- update ----
 
 func (m *Model) updateSFTP(tb *tab, msg tea.Msg) tea.Cmd {
 	v := tb.sftp
@@ -547,6 +666,12 @@ func (m *Model) updateSFTP(tb *tab, msg tea.Msg) tea.Cmd {
 			return cmd
 		}
 	}
+	if v.hist {
+		if k, ok := msg.(tea.KeyPressMsg); ok {
+			return m.histKey(v, k)
+		}
+		return nil
+	}
 	paneAt := func(x int) int {
 		if x < half {
 			return 0
@@ -557,17 +682,19 @@ func (m *Model) updateSFTP(tb *tab, msg tea.Msg) tea.Cmd {
 	case tea.PasteMsg:
 		var cmds []tea.Cmd
 		skipped := 0
+		to := dropTarget(v)
 		for _, f := range splitDropped(msg.Content) {
-			if fi, err := os.Stat(f); err == nil && fi.Mode().IsRegular() {
-				cmds = append(cmds, m.copyFile(v, true, f))
+			if _, err := os.Lstat(f); err == nil {
+				home, _ := os.UserHomeDir()
+				cmds = append(cmds, m.copyInto(v, fsx.Local{}, "Local", home, f, to))
 			} else {
 				skipped++
 			}
 		}
 		if len(cmds) > 0 {
-			m.info(fmt.Sprintf("Uploading %d dropped file(s) to %s", len(cmds), v.panes[1].dir))
+			m.info(fmt.Sprintf("Copying %d dropped item(s) to %s:%s", len(cmds), v.panes[to].label, v.panes[to].dir))
 		} else if skipped > 0 {
-			m.fail(errors.New("dropped text is not a local file path (folders are not supported yet)"))
+			m.fail(errors.New("dropped text is not a local file or folder path"))
 		}
 		return tea.Batch(cmds...)
 	case tea.MouseReleaseMsg:
@@ -575,7 +702,7 @@ func (m *Model) updateSFTP(tb *tab, msg tea.Msg) tea.Cmd {
 			fi, from := *v.drag, v.dragFrom
 			v.drag = nil
 			if paneAt(msg.X) != from {
-				return m.copyFile(v, from == 0, v.panes[from].join(fi.Name()))
+				return m.copyTo(v, from, v.panes[from].fs.Join(v.panes[from].dir, fi.Name()))
 			}
 		}
 	case tea.MouseWheelMsg:
@@ -595,28 +722,42 @@ func (m *Model) updateSFTP(tb *tab, msg tea.Msg) tea.Cmd {
 			p.sel = max(0, p.sel-1)
 		case "down", "j":
 			p.sel = max(0, min(len(p.entries)-1, p.sel+1))
+		case "home", "g":
+			p.sel = 0
+		case "end", "G":
+			p.sel = max(0, len(p.entries)-1)
 		case "enter", "right", "l":
 			m.sftpOpen(v, p)
 		case "backspace", "left", "h":
-			if p.remote {
-				p.dir = path.Dir(p.dir)
-			} else {
-				p.dir = filepath.Dir(p.dir)
-			}
+			old := p.dir
+			p.dir = v.fsOf(p).Dir(p.dir)
 			p.sel, p.top = 0, 0
 			if err := v.load(p); err != nil {
+				p.dir = old
 				m.fail(err)
 			}
 		case "r":
-			for _, p := range v.panes {
-				if err := v.load(p); err != nil {
-					m.fail(err)
-				}
-			}
+			m.reload(v)
 		case "c":
-			if len(p.entries) > 0 {
-				return m.copyFile(v, !p.remote, p.join(p.entries[p.sel].Name()))
+			if e := p.cur(); e != nil {
+				return m.copyTo(v, v.active, v.fsOf(p).Join(p.dir, e.Name()))
 			}
+		case "e", "f2":
+			return m.renamePrompt(v, p)
+		case "n":
+			return m.mkdirPrompt(v, p)
+		case "d", "delete":
+			return m.deletePrompt(v, p)
+		case "p":
+			return m.chmodPrompt(v, p)
+		case "x":
+			m.cancelNewest(v)
+		case "o":
+			return m.pickSource(tb, v, v.active)
+		case "t":
+			v.hist, v.histSel = true, 0
+		case "C":
+			clearFinished(v)
 		}
 		lh := m.listH(v)
 		if p.sel < p.top {
@@ -629,22 +770,35 @@ func (m *Model) updateSFTP(tb *tab, msg tea.Msg) tea.Cmd {
 }
 
 func (m *Model) sftpOpen(v *sftpView, p *fpane) {
-	if len(p.entries) == 0 || !p.entries[p.sel].IsDir() {
+	e := p.cur()
+	if e == nil || !e.IsDir() {
 		return
 	}
-	p.dir = p.join(p.entries[p.sel].Name())
+	old := p.dir
+	p.dir = v.fsOf(p).Join(p.dir, e.Name())
 	p.sel, p.top = 0, 0
 	if err := v.load(p); err != nil {
+		p.dir = old
 		m.fail(err)
 	}
 }
+
+// ---- view ----
+
+const maxShownTransfers = 5
 
 // listH is the rows left for file entries: body minus pane borders (2),
 // path and header rows (2) and the transfers block.
 func (m *Model) listH(v *sftpView) int {
 	tr := 0
-	if n := min(len(v.transfers), 5); n > 0 || v.drag != nil {
-		tr = 1 + n + 1
+	if len(v.transfers) > 0 || v.drag != nil {
+		tr = 1 + min(len(runningTransfers(v)), maxShownTransfers)
+		if len(v.transfers) > len(runningTransfers(v)) {
+			tr++ // summary line
+		}
+		if v.drag != nil {
+			tr++
+		}
 	}
 	return max(1, m.bodyH()-4-tr)
 }
@@ -659,6 +813,9 @@ func (m *Model) viewSFTPTab(t *tab) []string {
 			"", trunc(t.err.Error(), w-4), "", stDim.Render("enter retry · alt+w close")}, w, h)
 	}
 	v := t.sftp
+	if v.hist {
+		return m.viewHistory(v)
+	}
 	half := m.w / 2
 	iw := half - 2 // inside a pane's border
 	cols := [2][]string{}
@@ -667,19 +824,16 @@ func (m *Model) viewSFTPTab(t *tab) []string {
 		if i == v.active {
 			bst = lipgloss.NewStyle().Foreground(accent).Bold(true)
 		}
-		name := " Local "
-		if p.remote {
-			name = " " + trunc(v.label, iw-6) + " "
-		}
+		name := " " + trunc(p.label, iw-12) + " "
 		lines := []string{bst.Render("╭─" + name + strings.Repeat("─", max(0, iw-1-lipgloss.Width(name))) + "╮")}
-		var path string
+		var pathLine string
 		if v.edit != nil && v.edit.pane == i {
-			path = stAccent.Render(" / ") + v.edit.input.View()
+			pathLine = stAccent.Render(" / ") + v.edit.input.View()
 		} else {
-			path = " " + stBold.Render(truncLeft(tildify(p.dir, v.homes[i]), iw-2))
+			pathLine = " " + stBold.Render(truncLeft(tildify(p.dir, p.home), iw-2))
 		}
-		nameW := max(8, iw-13)
-		lines = append(lines, path, stDim.Render(fmt.Sprintf(" %-*s %10s", nameW, "Name", "Size")))
+		nameW := max(8, iw-19)
+		lines = append(lines, pathLine, stDim.Render(fmt.Sprintf(" %-*s %5s %10s", nameW, "Name", "Perm", "Size")))
 		for j := p.top; j < len(p.entries) && j < p.top+m.listH(v); j++ {
 			e := p.entries[j]
 			name := e.Name()
@@ -687,7 +841,7 @@ func (m *Model) viewSFTPTab(t *tab) []string {
 			if e.IsDir() {
 				name, size = name+"/", ""
 			}
-			l := fit(fmt.Sprintf(" %-*s %10s", nameW, trunc(name, nameW), size), iw)
+			l := fit(fmt.Sprintf(" %-*s %5s %10s", nameW, trunc(name, nameW), fsx.Octal(e.Mode()), size), iw)
 			if e.IsDir() {
 				l = stAccent.Render(l)
 			}
@@ -702,7 +856,7 @@ func (m *Model) viewSFTPTab(t *tab) []string {
 				v.panes[i].sel = j
 				if double && e.IsDir() {
 					m.sftpOpen(v, v.panes[i])
-				} else if !e.IsDir() {
+				} else if !double {
 					v.drag, v.dragFrom = &e, i
 				}
 				return nil
@@ -733,29 +887,65 @@ func (m *Model) viewSFTPTab(t *tab) []string {
 	if len(v.transfers) == 0 && v.drag == nil {
 		return out
 	}
-	out = append(out, stDim.Render(" Transfers"))
-	ts := v.transfers
-	if len(ts) > 5 {
-		ts = ts[len(ts)-5:]
+	out = append(out, stDim.Render(" Transfers   t history · C clear finished · x cancel newest"))
+	running := runningTransfers(v)
+	if len(running) > maxShownTransfers {
+		running = running[len(running)-maxShownTransfers:]
 	}
-	for _, t := range ts {
-		d := t.done.Load()
-		el := time.Since(t.start)
-		state := fmt.Sprintf("%3d%%", 100*d/max(1, t.total))
-		st := lipgloss.NewStyle()
-		if t.finished > 0 {
-			el, state, st = t.finished, "done", lipgloss.NewStyle().Foreground(good)
-		}
-		if t.err != nil {
-			state, st = "failed: "+t.err.Error(), lipgloss.NewStyle().Foreground(bad)
-		}
-		out = append(out, fmt.Sprintf(" %-30s %8s / %-8s %7.1f MB/s  %s", trunc(t.name, 30), human(d), human(t.total),
-			float64(d)/1e6/max(el.Seconds(), 0.001), st.Render(state)))
+	for _, t := range running {
+		out = append(out, transferLine(t, m.w))
+	}
+	if s := transferSummary(v); s != "" {
+		out = append(out, s)
 	}
 	if v.drag != nil {
 		out = append(out, stAccent.Render(" dragging "+(*v.drag).Name()+" — release over the other pane to copy"))
 	}
 	return out
+}
+
+// transferLine renders " name  ███████░░░  62%  3.1M / 5.0M  48.2 MB/s  ETA 0:04".
+func transferLine(t *transfer, w int) string {
+	done, total := t.pr.Bytes.Load(), t.total.Load()
+	el := time.Since(t.start)
+	if !t.running() {
+		el = t.finished
+	}
+	pct := 100
+	if total > 0 {
+		pct = int(min(100, done*100/total))
+	}
+	speed := float64(done) / max(el.Seconds(), 0.001)
+	color, state := accent, fmt.Sprintf("%3d%%", pct)
+	switch {
+	case errors.Is(t.err, context.Canceled):
+		color, state = dim, "canceled"
+	case t.err != nil:
+		color, state = bad, "failed"
+	case !t.running():
+		color, state = good, "done ✓"
+	}
+	extra := ""
+	if t.running() && speed > 0 && total > done {
+		extra = "  ETA " + fmtDur(time.Duration(float64(total-done)/speed*float64(time.Second)))
+	}
+	if t.folder {
+		extra = fmt.Sprintf("  %d files", t.pr.Files.Load()) + extra
+	}
+	barW := max(10, min(30, w/5))
+	filled := barW * pct / 100
+	st := lipgloss.NewStyle().Foreground(color)
+	bar := st.Render(strings.Repeat("█", filled)) + stDim.Render(strings.Repeat("░", barW-filled))
+	return fmt.Sprintf(" %-24s %s %s  %8s / %-8s %7.1f MB/s%s", trunc(t.name, 24), bar, st.Render(fmt.Sprintf("%-8s", state)),
+		human(done), human(total), speed/1e6, extra)
+}
+
+func fmtDur(d time.Duration) string {
+	s := int(d.Round(time.Second).Seconds())
+	if s >= 3600 {
+		return fmt.Sprintf("%d:%02d:%02d", s/3600, s/60%60, s%60)
+	}
+	return fmt.Sprintf("%d:%02d", s/60, s%60)
 }
 
 // tildify shows dir under home as ~/...

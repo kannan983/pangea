@@ -150,6 +150,31 @@ func (s *Session) ScrollbackLen() int { return s.emu.ScrollbackLen() }
 
 func (s *Session) Scrollback(from, to int) []string { return s.emu.ScrollbackRange(from, to) }
 
+// PlainScreen returns the visible screen as plain text, one string per row
+// (wide characters occupy their cells; nothing is trimmed).
+func (s *Session) PlainScreen() []string { return plainRows(s.emu) }
+
+func plainRows(e *vt.SafeEmulator) []string {
+	w, h := e.Width(), e.Height()
+	rows := make([]string, h)
+	var b strings.Builder
+	for y := range h {
+		b.Reset()
+		for x := 0; x < w; {
+			c := e.CellAt(x, y)
+			if c == nil || c.Content == "" {
+				b.WriteByte(' ')
+				x++
+				continue
+			}
+			b.WriteString(c.Content)
+			x += max(1, c.Width)
+		}
+		rows[y] = b.String()
+	}
+	return rows
+}
+
 // Resize keeps PTY and emulator in step. When shrinking past the cursor,
 // content scrolls up like xterm instead of being cropped (x/vt crops, and
 // the shell then overwrites the last output line).

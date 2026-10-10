@@ -3,9 +3,11 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/kannan983/pangea/internal/health"
 	"github.com/kannan983/pangea/internal/session"
 	"github.com/kannan983/pangea/internal/sshc"
 	"github.com/kannan983/pangea/internal/store"
@@ -63,10 +66,10 @@ type tab struct {
 	host     store.Host
 	state    tabState
 	err      error
-	sess     *session.Session
+	panes    []*pane // terminal tabs: one shell, or two when split
+	focus    int     // pane with the keyboard
 	sftp     *sftpView
 	activity bool // output while in the background
-	scroll   int  // lines scrolled back into history
 }
 
 func (t *tab) title() string {
@@ -81,10 +84,14 @@ func (t *tab) title() string {
 
 func (t *tab) client() *ssh.Client {
 	switch {
-	case t.sess != nil:
-		return t.sess.Client
+	case len(t.panes) > 0:
+		return t.panes[0].sess.Client
 	case t.sftp != nil:
-		return t.sftp.conn
+		for _, p := range t.sftp.panes {
+			if p.conn != nil {
+				return p.conn
+			}
+		}
 	}
 	return nil
 }
@@ -121,6 +128,10 @@ type Model struct {
 	settings *settingsView // shown in the Hosts tab instead of hosts
 	sideFoc  bool          // keyboard is in the Hosts tab sidebar
 	sideSel  int
+	mission  *missionView // the 1202 easter egg, shown in the Hosts tab
+	eggBuf   string
+
+	health map[string]health.Result // by host ID
 
 	zones     []zone
 	zoneOY    int // y offset added by addZone (body starts below the tab bar)
@@ -144,7 +155,50 @@ func New(st *store.Store, v *vault.Vault, warn string) *Model {
 
 func (m *Model) SetProgram(p *tea.Program) { m.prog = p }
 
-func (m *Model) Init() tea.Cmd { return nil }
+func (m *Model) Init() tea.Cmd { return m.checkHealth() }
+
+type healthMsg struct {
+	id string
+	r  health.Result
+}
+type healthRoundMsg struct{}
+type healthTickMsg struct{}
+
+const healthEvery = 30 * time.Second
+
+// checkHealth probes every saved host's SSH port in the background.
+func (m *Model) checkHealth() tea.Cmd {
+	addrs := map[string]string{}
+	for _, h := range m.st.Hosts {
+		addrs[h.ID] = h.Addr()
+	}
+	return func() tea.Msg {
+		health.CheckAll(context.Background(), addrs, 16, 3*time.Second, func(id string, r health.Result) {
+			m.prog.Send(healthMsg{id, r})
+		})
+		return healthRoundMsg{}
+	}
+}
+
+func (m *Model) onHealth(msg healthMsg) {
+	if m.health == nil {
+		m.health = map[string]health.Result{}
+	}
+	if prev, ok := m.health[msg.id]; !ok || prev.State != msg.r.State {
+		label := msg.id
+		for _, h := range m.st.Hosts {
+			if h.ID == msg.id {
+				label = h.Label
+			}
+		}
+		slog.Info("host health", "host", label, "state", stateName(msg.r.State), "rtt", msg.r.RTT, "err", msg.r.Err)
+	}
+	m.health[msg.id] = msg.r
+}
+
+func stateName(s health.State) string {
+	return [...]string{"unknown", "up", "slow", "down"}[s]
+}
 
 func (m *Model) cur() *tab { return m.tabs[m.active] }
 
@@ -160,8 +214,6 @@ func (m *Model) mainW() int { return max(20, m.w-sidebarW-1) }
 func (m *Model) mainH() int { return m.bodyH() }
 
 const termPadX, termPadY = 2, 1 // border + padding left, border top
-
-func (m *Model) termSize() (int, int) { return max(10, m.w-2*termPadX), max(3, m.h-1-2*termPadY) }
 
 func (m *Model) knownHosts() string { return filepath.Join(m.st.Dir, "known_hosts") }
 
@@ -199,8 +251,10 @@ func (m *Model) tabIndex(t *tab) int {
 
 func (m *Model) tabOf(s *session.Session) *tab {
 	for _, t := range m.tabs {
-		if t.sess == s {
-			return t
+		for _, p := range t.panes {
+			if p.sess == s {
+				return t
+			}
 		}
 	}
 	return nil
@@ -212,10 +266,16 @@ func (m *Model) release(c *ssh.Client) {
 		return
 	}
 	for _, t := range m.tabs {
-		if t.client() == c {
+		for _, p := range t.panes {
+			if p.sess.Client == c && !p.sess.Closed() {
+				return
+			}
+		}
+		if t.sftp != nil && (t.sftp.panes[0].conn == c || t.sftp.panes[1].conn == c) {
 			return
 		}
 	}
+	slog.Debug("connection closed")
 	c.Close()
 }
 
@@ -229,14 +289,19 @@ func (m *Model) closeTab(t *tab) {
 		m.active = max(0, m.active-1)
 	}
 	m.cancelPrompts(t)
-	c := t.client()
-	if t.sess != nil {
-		t.sess.Close()
+	conns := []*ssh.Client{t.client()}
+	for _, p := range t.panes {
+		p.sess.Close()
 	}
 	if t.sftp != nil {
-		t.sftp.sc.Close()
+		for _, p := range t.sftp.panes {
+			p.close()
+			conns = append(conns, p.conn)
+		}
 	}
-	m.release(c)
+	for _, c := range conns {
+		m.release(c)
+	}
 }
 
 func (m *Model) askCloseTab(t *tab) {
@@ -261,7 +326,7 @@ func (m *Model) connect(h store.Host, t *tab) tea.Cmd {
 		t = &tab{kind: tabTerm, host: h}
 		m.addTab(t)
 	}
-	t.state, t.err, t.sess, t.scroll = stConnecting, nil, nil, 0
+	t.state, t.err, t.panes, t.focus = stConnecting, nil, nil, 0
 	return m.dial(t)
 }
 
@@ -312,16 +377,16 @@ func (m *Model) onDialed(msg dialedMsg) tea.Cmd {
 	if t.kind == tabSFTP {
 		return m.startSFTP(t, msg.c)
 	}
-	w, h := m.termSize()
-	s, err := session.Open(msg.c, w, h,
-		func(s *session.Session) { go m.prog.Send(outputMsg{s}) },
-		func(s *session.Session) { go m.prog.Send(closedMsg{s}) })
+	in := m.paneRects(1)[0].inner()
+	s, err := m.openSession(t, msg.c, in.w, in.h)
 	if err != nil {
 		msg.c.Close()
 		t.state, t.err = stFailed, err
+		slog.Warn("shell failed", "host", t.host.Label, "err", err)
 		return nil
 	}
-	t.sess, t.state = s, stReady
+	t.panes, t.focus, t.state = []*pane{{sess: s}}, 0, stReady
+	slog.Info("session open", "host", t.host.Label, "addr", t.host.Addr())
 	if t.host.ID != "" {
 		m.st.Touch(t.host.ID)
 		m.save()
@@ -336,11 +401,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 		m.hosts.search.SetWidth(m.mainW() - 6)
-		w, h := m.termSize()
 		for _, t := range m.tabs {
-			if t.sess != nil && !t.sess.Closed() {
-				t.sess.Resize(w, h)
-			}
+			m.resizePanes(t)
 		}
 		return m, nil
 	case dialedMsg:
@@ -356,19 +418,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case closedMsg:
 		if t := m.tabOf(msg.s); t != nil {
-			t.state = stEnded
-			c := t.sess.Client
-			t.sess = nil
-			m.release(c)
-			if t != m.cur() {
-				m.info(t.host.Label + ": session ended")
+			for i, p := range t.panes {
+				if p.sess == msg.s {
+					t.panes = append(t.panes[:i], t.panes[i+1:]...)
+				}
 			}
+			t.focus = 0
+			slog.Info("shell ended", "host", t.host.Label, "panes_left", len(t.panes))
+			if len(t.panes) == 0 {
+				t.state = stEnded
+				if t != m.cur() {
+					m.info(t.host.Label + ": session ended")
+				}
+			} else {
+				m.resizePanes(t)
+			}
+			m.release(msg.s.Client)
 		}
 		return m, nil
+	case splitMsg:
+		m.onSplit(msg)
+		return m, nil
 	case fullscreenDoneMsg:
-		if msg.t.sess != nil && !msg.t.sess.Closed() {
-			msg.t.sess.Resize(m.termSize())
-		}
+		m.resizePanes(msg.t)
 		return m, nil
 	case promptMsg:
 		return m, m.pushPrompt(msg.p)
@@ -384,6 +456,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case transferDoneMsg:
 		m.transferDone(msg)
 		return m, nil
+	case opDoneMsg:
+		m.opDone(msg)
+		return m, nil
+	case paneReadyMsg:
+		m.onPaneReady(msg)
+		return m, nil
+	case healthMsg:
+		m.onHealth(msg)
+		return m, nil
+	case healthRoundMsg:
+		return m, tea.Tick(healthEvery, func(time.Time) tea.Msg { return healthTickMsg{} })
+	case healthTickMsg:
+		return m, m.checkHealth()
+	case missionTickMsg:
+		return m, m.missionSample(msg.v)
 	}
 
 	if len(m.prompts) > 0 {
@@ -425,6 +512,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case m.sideFoc:
 			return m, m.updateSidebar(msg)
+		case m.mission != nil:
+			if k, ok := msg.(tea.KeyPressMsg); ok && (k.String() == "esc" || k.String() == "enter") {
+				m.mission = nil
+			}
+			return m, nil
 		case m.form != nil:
 			return m, m.updateForm(msg)
 		case m.settings != nil:
@@ -462,15 +554,30 @@ func (m *Model) globalKey(k tea.KeyPressMsg) (tea.Cmd, bool) {
 		m.switchTo(0)
 		return nil, true
 	case "alt+w":
+		if len(t.panes) == 2 {
+			p := t.pane()
+			m.ask("Close this pane? (y/n)", func() tea.Cmd { p.sess.Close(); return nil })
+			return nil, true
+		}
 		m.askCloseTab(t)
 		return nil, true
 	case "alt+s":
 		if t.kind == tabTerm {
 			return m.openSFTPFor(t), true
 		}
+	case "alt+\\":
+		if t.kind == tabTerm {
+			return m.split(t), true
+		}
+	case "alt+o":
+		if t.kind == tabTerm {
+			m.popOut(t)
+			return nil, true
+		}
 	case "f11":
 		if t.kind == tabTerm && t.state == stReady {
-			return tea.Exec(&termCmd{func() error { return t.sess.Attach(os.Stdin, os.Stdout) }},
+			s := t.pane().sess
+			return tea.Exec(&termCmd{func() error { return s.Attach(os.Stdin, os.Stdout) }},
 				func(err error) tea.Msg { return fullscreenDoneMsg{t, err} }), true
 		}
 	case "ctrl+c":
@@ -497,8 +604,8 @@ func (m *Model) quit() tea.Cmd {
 	}
 	m.ask(fmt.Sprintf("%d session(s) open — quit and close them? (y/n)", live), func() tea.Cmd {
 		for _, t := range m.tabs {
-			if t.sess != nil {
-				t.sess.Close()
+			for _, p := range t.panes {
+				p.sess.Close()
 			}
 		}
 		return tea.Quit
@@ -594,6 +701,8 @@ func (m *Model) View() tea.View {
 func (m *Model) viewHostsTab() []string {
 	var main []string
 	switch {
+	case m.mission != nil:
+		main = m.viewMission()
 	case m.form != nil:
 		main = m.viewForm()
 	case m.settings != nil:
@@ -730,7 +839,7 @@ func (m *Model) openSessions() int {
 
 // setMode shows mode's hosts (and leaves form/settings).
 func (m *Model) setMode(mode string) {
-	m.mode, m.form, m.settings = mode, nil, nil
+	m.mode, m.form, m.settings, m.mission = mode, nil, nil, nil
 	m.hosts.sel, m.hosts.scroll = 0, 0
 }
 
@@ -809,10 +918,10 @@ func (m *Model) viewTabBar() string {
 		// Terminal tabs have no footer: messages and hints go here.
 		if m.status != "" {
 			right = m.statusSt.Render(m.status)
-		} else if t := m.cur(); t.scroll > 0 {
-			right = lipgloss.NewStyle().Foreground(amber).Render(fmt.Sprintf("history −%d · any key returns", t.scroll))
+		} else if p := m.cur().pane(); p != nil && p.scroll > 0 {
+			right = lipgloss.NewStyle().Foreground(amber).Render(fmt.Sprintf("history −%d · any key returns", p.scroll))
 		} else {
-			right = stDim.Render("ctrl+] hosts · alt+s sftp · alt+1-9 tabs · alt+w close · F11 full")
+			right = stDim.Render("ctrl+] hosts · alt+s sftp · alt+\\ split · alt+w close · F11 full")
 		}
 	}
 	left := b.String()
@@ -845,7 +954,10 @@ func (m *Model) keyHelp() string {
 		if t.sftp != nil && t.sftp.edit != nil {
 			return "type a path · tab complete · enter go · esc cancel"
 		}
-		return "tab pane · ↑↓ move · enter open · backspace up · / go to path · c copy → · r refresh · drag across · drop to upload · alt+w close"
+		if t.sftp != nil && t.sftp.hist {
+			return "↑↓ move · enter go to folder · c clear finished · esc/t close"
+		}
+		return "tab pane · o open server · / path · c copy · e rename · n folder · d delete · p perms · t history · x cancel · alt+w close"
 	}
 	return ""
 }

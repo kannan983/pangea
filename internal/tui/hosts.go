@@ -15,6 +15,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/kannan983/pangea/internal/health"
 	"github.com/kannan983/pangea/internal/store"
 )
 
@@ -117,9 +118,9 @@ func (m *Model) layoutList(L *hostsLayout, hosts []int) {
 	w := m.mainW() - 2
 	nameW := max(12, w*3/10)
 	addrW := max(14, w*3/10)
-	tagW := max(0, w-nameW-addrW-6-12)
-	// Rows are " " + mark (2) + badge (3) + " name address tags last-used".
-	L.lines = append(L.lines, stDim.Render(fit(fmt.Sprintf("       %-*s %-*s %-*s %s", nameW, "NAME", addrW, "ADDRESS", tagW, "TAGS", "LAST USED"), w)))
+	tagW := max(0, w-nameW-addrW-6-12-10)
+	// Rows are " " + mark (2) + badge (3) + " name address tags status last-used".
+	L.lines = append(L.lines, stDim.Render(fit(fmt.Sprintf("       %-*s %-*s %-*s %-9s %s", nameW, "NAME", addrW, "ADDRESS", tagW, "TAGS", "STATUS", "LAST USED"), w)))
 	for i, hi := range hosts {
 		h := m.st.Hosts[hi]
 		addr := h.Addr()
@@ -129,13 +130,16 @@ func (m *Model) layoutList(L *hostsLayout, hosts []int) {
 		sel := m.isSel(i)
 		badge := lipgloss.NewStyle().Background(lipgloss.Color(colorFor(h.Mode + h.Label))).
 			Foreground(lipgloss.Color("#ffffff")).Bold(true).Render(" " + initial(h.Label) + " ")
-		rest := fmt.Sprintf(" %-*s %-*s %-*s %s", nameW, trunc(h.Label, nameW), addrW, trunc(addr, addrW),
-			tagW, trunc(strings.Join(h.Tags, ", "), tagW), ago(h.LastUsed))
+		pre := fmt.Sprintf(" %-*s %-*s %-*s ", nameW, trunc(h.Label, nameW), addrW, trunc(addr, addrW),
+			tagW, trunc(strings.Join(h.Tags, ", "), tagW))
+		status := m.healthBadge(h.ID)
+		post := " " + ago(h.LastUsed)
 		mark := "  "
 		if sel {
 			mark = stAccent.Render("▌ ")
-			rest = stSel.Render(fit(rest, w-5))
+			pre, post = stSel.Render(pre), stSel.Render(fit(post, w-5-lipgloss.Width(pre)-9))
 		}
+		rest := pre + status + post
 		L.cells = append(L.cells, cell{host: hi, vy: len(L.lines), x: 1, w: w, h: 1})
 		L.lines = append(L.lines, " "+mark+badge+rest)
 	}
@@ -158,7 +162,7 @@ func (m *Model) layoutGrid(L *hostsLayout, hosts []int) {
 			for _, t := range h.Tags {
 				sub += ", " + t
 			}
-			cards[c] = card(cw, initial(h.Label), h.Label, sub, colorFor(h.Mode+h.Label), m.isSel(r*cols+c))
+			cards[c] = card(cw, initial(h.Label), h.Label, m.healthDot(h.ID), sub, colorFor(h.Mode+h.Label), m.isSel(r*cols+c))
 			L.cells = append(L.cells, cell{host: hi, vy: vy, x: 1 + c*(cw+cardGap), w: cw, h: cardH})
 		}
 		for line := range cardH {
@@ -220,17 +224,18 @@ func colorFor(s string) string {
 }
 
 // card renders a 4-line bordered card of width w.
-func card(w int, badge, title, sub, color string, selected bool) []string {
+func card(w int, badge, title, dot, sub, color string, selected bool) []string {
 	border := lipgloss.NewStyle().Foreground(lipgloss.Color("#3b4261"))
 	if selected {
 		border = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	}
 	inner := w - 2
 	b := lipgloss.NewStyle().Background(lipgloss.Color(color)).Foreground(lipgloss.Color("#ffffff")).Bold(true).Render(" " + badge + " ")
-	t := stBold.Render(trunc(title, inner-6))
+	t := stBold.Render(trunc(title, inner-8))
 	if selected {
-		t = stBold.Foreground(accent).Render(trunc(title, inner-6))
+		t = stBold.Foreground(accent).Render(trunc(title, inner-8))
 	}
+	t += " " + dot
 	return []string{
 		border.Render("╭" + strings.Repeat("─", inner) + "╮"),
 		border.Render("│") + fit(" "+b+" "+t, inner) + border.Render("│"),
@@ -321,6 +326,9 @@ func (m *Model) searchKey(k tea.KeyPressMsg, L hostsLayout) tea.Cmd {
 
 func (m *Model) gridKey(k tea.KeyPressMsg, L hostsLayout) tea.Cmd {
 	hv := &m.hosts
+	if cmd := m.eggKey(k.String()); cmd != nil {
+		return cmd
+	}
 	n := len(L.cells)
 	if hv.sel >= n {
 		hv.sel = max(0, n-1)
@@ -532,4 +540,33 @@ func (m *Model) viewHosts() []string {
 		})
 	}
 	return lines
+}
+
+// healthDot is a colored ● for a host's last health check.
+func (m *Model) healthDot(id string) string {
+	r, ok := m.health[id]
+	if !ok {
+		return stDim.Render("○")
+	}
+	switch r.State {
+	case health.Up:
+		return lipgloss.NewStyle().Foreground(good).Render("●")
+	case health.Slow:
+		return lipgloss.NewStyle().Foreground(amber).Render("●")
+	}
+	return lipgloss.NewStyle().Foreground(bad).Render("●")
+}
+
+// healthBadge is the 9-cell STATUS column: "● 12ms", "● down".
+func (m *Model) healthBadge(id string) string {
+	r, ok := m.health[id]
+	text := "…"
+	switch {
+	case !ok:
+	case r.State == health.Down:
+		text = "down"
+	default:
+		text = fmt.Sprintf("%dms", r.RTT.Milliseconds())
+	}
+	return m.healthDot(id) + " " + fit(text, 7)
 }

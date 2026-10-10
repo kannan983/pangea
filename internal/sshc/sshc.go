@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -125,6 +126,9 @@ func Dial(h store.Host, knownHostsFile string, p Prompter, saved string) (c *ssh
 		}), 3),
 	)
 
+	// Log what is tried, never secrets.
+	slog.Info("dial", "host", h.Label, "addr", addr, "user", user, "key_file", h.KeyPath != "",
+		"saved_password", saved != "", "host_key_algos", algos)
 	c, err = ssh.Dial("tcp", addr, &ssh.ClientConfig{
 		User:              user,
 		Auth:              auths,
@@ -136,11 +140,14 @@ func Dial(h store.Host, knownHostsFile string, p Prompter, saved string) (c *ssh
 		if c != nil {
 			c.Close()
 		}
+		slog.Info("dial canceled", "host", h.Label)
 		return nil, "", ErrCanceled
 	}
 	if err != nil {
+		slog.Warn("dial failed", "host", h.Label, "addr", addr, "err", err)
 		return nil, "", err
 	}
+	slog.Info("connected", "host", h.Label, "server", string(c.ServerVersion()), "password_typed", typed != "")
 	go keepalive(c)
 	if typed == saved {
 		typed = ""
@@ -221,14 +228,17 @@ func hostKeyCallback(addr, ownFile string, p Prompter) (ssh.HostKeyCallback, []s
 			return err // nil (known and matching) or a real error
 		}
 		if len(ke.Want) > 0 {
+			slog.Warn("host key mismatch", "host", hostname, "got", ssh.FingerprintSHA256(key), "known_in", ke.Want[0].Filename)
 			return fmt.Errorf("HOST KEY CHANGED for %s (got %s %s): refusing to connect. "+
 				"If this is expected, remove the old entry from %s",
 				hostname, key.Type(), ssh.FingerprintSHA256(key), ke.Want[0].Filename)
 		}
 		if !p.Confirm(fmt.Sprintf("Unknown host %s\n%s key fingerprint\n%s\n\nTrust it and save to Pangea's known_hosts?",
 			hostname, key.Type(), ssh.FingerprintSHA256(key))) {
+			slog.Info("host key rejected by user", "host", hostname, "fingerprint", ssh.FingerprintSHA256(key))
 			return errors.New("host key not trusted")
 		}
+		slog.Info("host key trusted", "host", hostname, "type", key.Type(), "fingerprint", ssh.FingerprintSHA256(key))
 		f, err := os.OpenFile(ownFile, os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err

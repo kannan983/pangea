@@ -45,7 +45,7 @@ func (m *Model) openSettings() {
 	v.defMode.ShowSuggestions = true
 	v.defMode.SetSuggestions(m.st.Settings.Modes)
 	v.local.Focus()
-	m.settings, m.form = v, nil
+	m.settings, m.form, m.mission = v, nil, nil
 }
 
 func (m *Model) settingsHelp() string {

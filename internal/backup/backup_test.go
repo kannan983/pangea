@@ -70,4 +70,12 @@ func TestBackupRestore(t *testing.T) {
 	if st2.Settings.DefaultMode != "Office" {
 		t.Fatalf("settings: %+v", st2.Settings)
 	}
+
+	// A folder with only a log file is not "existing config".
+	fresh := filepath.Join(tmp, "fresh")
+	os.MkdirAll(fresh, 0o700)
+	os.WriteFile(filepath.Join(fresh, "pangea.log"), []byte("log"), 0o600)
+	if moved, err := Restore(file, "correct horse", fresh); err != nil || moved != "" {
+		t.Fatalf("fresh restore moved %q, err %v", moved, err)
+	}
 }

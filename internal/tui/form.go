@@ -86,7 +86,7 @@ func (m *Model) openForm(h store.Host, clone bool) tea.Cmd {
 		f.fields[fPass].Placeholder = "•••••• saved — type to change, ctrl+x to remove"
 	}
 	f.focus = 0
-	m.form = f
+	m.form, m.mission = f, nil
 	return f.fields[f.focus].Focus()
 }
 
