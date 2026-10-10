@@ -1,0 +1,18 @@
+# AI tool folders
+.claude/
+.moai/
+.serena/
+memory/
+
+# build output
+dist/
+build/
+/pangea
+*.exe
+
+# secrets (includes the throwaway test-server key)
+.env
+*.pem
+id_*
+!id_*.pub
+spikes/testenv/id_ed25519.pub

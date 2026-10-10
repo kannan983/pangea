@@ -1,0 +1,49 @@
+name: lint
+# push is scoped to main so a push to a PR branch fires only the
+# pull_request run, not both. Merges to main still lint via push.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    uses: charmbracelet/meta/.github/workflows/lint.yml@main
+    with:
+      golangci_path: .golangci.yml
+      golangci_version: latest
+      timeout: 10m
+
+  # The conformance tests are a separate module, so the root lint job's ./...
+  # never reaches them. Lint them here with the same config.
+  #
+  # The module imports go.mitchellh.com/libghostty, a cgo package. golangci-lint
+  # typechecks cgo files, which runs pkg-config and compiles the C preamble far
+  # enough to need the real headers. So, contrary to intuition, a C toolchain IS
+  # required: we restore the prebuilt libghostty-vt (headers plus .pc file) from
+  # the same cache conformance.yml populates and point pkg-config at it. No
+  # linking happens during typecheck, so the static archive itself is unused.
+  #
+  # This is a standalone job rather than the shared meta workflow because that
+  # workflow cannot restore a cache or set PKG_CONFIG_PATH for its lint step.
+  lint-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ./internal/conformance/go.mod
+          cache: true
+
+      # The same cache conformance.yml populates, keyed the same way, so a
+      # warm cache there is a cache hit here and no rebuild happens.
+      - uses: ./.github/actions/libghostty-vt
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          working-directory: internal/conformance
+          args: |
+            --config="../../.golangci.yml" --timeout=10m ./...
+          version: latest

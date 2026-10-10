@@ -1,0 +1,50 @@
+diff --color -ruN upstream/ultraviolet@v0.0.0-20261008173134-6b8d4baf91b4/buffer.go third_party/ultraviolet/buffer.go
+--- upstream/ultraviolet@v0.0.0-20261008173134-6b8d4baf91b4/buffer.go	2026-10-10 15:13:34.874667105 +0400
++++ third_party/ultraviolet/buffer.go	2026-10-10 15:49:21.885964104 +0400
+@@ -1,6 +1,7 @@
+ package uv
+ 
+ import (
++	"slices"
+ 	"bytes"
+ 	"image"
+ 	"io"
+@@ -502,13 +503,13 @@
+ 		n = area.Max.Y - y
+ 	}
+ 
+-	// Shift cells up within the bounds
+-	for dst := y; dst < area.Max.Y-n; dst++ {
+-		src := dst + n
+-		for x := area.Min.X; x < area.Max.X; x++ {
+-			// We don't need to clone c here because we're just moving cells up.
+-			b.Lines[dst][x] = b.Lines[src][x]
+-		}
++	// Full-width region: rotate whole lines instead of copying cells.
++	if area.Min.X == 0 && area.Max.X == b.Width() {
++		removed := slices.Clone(b.Lines[y : y+n])
++		copy(b.Lines[y:], b.Lines[y+n:area.Max.Y])
++		copy(b.Lines[area.Max.Y-n:area.Max.Y], removed)
++	} else {
++		b.shiftCellsUp(y, n, area)
+ 	}
+ 
+ 	// Fill the bottom n lines with blank cells
+@@ -518,6 +519,17 @@
+ 		}
+ 	}
+ }
++
++func (b *Buffer) shiftCellsUp(y, n int, area Rectangle) {
++	// Shift cells up within the bounds
++	for dst := y; dst < area.Max.Y-n; dst++ {
++		src := dst + n
++		for x := area.Min.X; x < area.Max.X; x++ {
++			// We don't need to clone c here because we're just moving cells up.
++			b.Lines[dst][x] = b.Lines[src][x]
++		}
++	}
++}
+ 
+ // DeleteLine deletes n lines at the given line position, with the given
+ // optional cell, within the specified rectangles. If no rectangles are

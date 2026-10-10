@@ -1,0 +1,77 @@
+name: conformance
+
+# Fuzz tests that drive the renderer against real terminal emulators.
+#
+# They live in their own module (internal/conformance) because the reference
+# emulator is a cgo package with a newer Go requirement, and neither cost
+# belongs in the library that ships to users. That also means the root module's
+# CI never runs them, so they get their own workflow here.
+
+# push is scoped to main so a push to a PR branch fires only the
+# pull_request run, not both. Merges to main still run via push.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # A nightly coverage-guided run, so new bugs are found without waiting for
+    # someone to run -fuzz by hand.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ./internal/conformance/go.mod
+          cache: true
+
+      # Builds or restores libghostty-vt and puts it on PKG_CONFIG_PATH.
+      - uses: ./.github/actions/libghostty-vt
+
+      - name: Test
+        working-directory: ./internal/conformance
+        run: go test -count=1 -timeout 10m ./...
+
+
+  # Coverage-guided fuzzing. This is deliberately not run on every push; it is
+  # slow and its job is to find new bugs, not to gate commits. The test job
+  # above already replays every known failing input on each push.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzRenderer
+          - FuzzRendererIdempotent
+          - FuzzRedrawResyncs
+          - FuzzScreenShowsContent
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ./internal/conformance/go.mod
+          cache: true
+
+      - uses: ./.github/actions/libghostty-vt
+
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: ./internal/conformance
+        run: go test -run='XXX' -fuzz='${{ matrix.target }}$' -fuzztime=15m
+
+      # A new crasher is written under testdata/ on failure. Upload it so it can
+      # be committed as a regression test rather than lost with the runner.
+      - name: Upload new crashers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: crashers-${{ matrix.target }}
+          path: internal/conformance/testdata/fuzz/
+          if-no-files-found: ignore

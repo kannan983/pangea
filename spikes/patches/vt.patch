@@ -1,0 +1,275 @@
+diff --color -ruN upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/emulator.go third_party/vt/emulator.go
+--- upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/emulator.go	2026-10-10 15:13:33.341777537 +0400
++++ third_party/vt/emulator.go	2026-10-10 16:23:28.412847281 +0400
+@@ -459,16 +459,6 @@
+ 	return sb.Len()
+ }
+ 
+-// ScrollbackCellAt returns the cell at the given position in the scrollback buffer.
+-// x is the column, y is the line index (0 = oldest line in scrollback).
+-// Returns nil if position is out of bounds.
+-func (e *Emulator) ScrollbackCellAt(x, y int) *uv.Cell {
+-	sb := e.Scrollback()
+-	if sb == nil {
+-		return nil
+-	}
+-	return sb.CellAt(x, y)
+-}
+ 
+ // SetScrollbackSize sets the maximum number of lines in the scrollback buffer.
+ func (e *Emulator) SetScrollbackSize(maxLines int) {
+diff --color -ruN upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/go.mod third_party/vt/go.mod
+--- upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/go.mod	2026-10-10 15:13:33.342612966 +0400
++++ third_party/vt/go.mod	2026-10-10 15:49:27.607055562 +0400
+@@ -1,26 +1,28 @@
+ module github.com/charmbracelet/x/vt
+ 
+-go 1.24.2
++go 1.26.0
+ 
+ require (
+ 	github.com/charmbracelet/ultraviolet v0.0.0-20260303162955-0b88c25f3fff
+-	github.com/charmbracelet/x/ansi v0.11.7
++	github.com/charmbracelet/x/ansi v0.11.9
+ 	github.com/charmbracelet/x/exp/ordered v0.1.0
+ )
+ 
+ require (
+-	github.com/charmbracelet/colorprofile v0.4.2 // indirect
++	github.com/charmbracelet/colorprofile v0.4.3 // indirect
+ 	github.com/charmbracelet/x/term v0.2.2 // indirect
+ 	github.com/charmbracelet/x/termios v0.1.1 // indirect
+ 	github.com/charmbracelet/x/windows v0.2.2 // indirect
+ 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
+ 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
+-	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
+-	github.com/mattn/go-runewidth v0.0.23 // indirect
++	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
++	github.com/mattn/go-runewidth v0.0.30 // indirect
+ 	github.com/muesli/cancelreader v0.2.2 // indirect
+ 	github.com/rivo/uniseg v0.4.7 // indirect
+-	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
++	github.com/xo/terminfo v1.0.0 // indirect
+ 	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
+-	golang.org/x/sync v0.19.0 // indirect
+-	golang.org/x/sys v0.41.0 // indirect
++	golang.org/x/sync v0.22.0 // indirect
++	golang.org/x/sys v0.47.0 // indirect
+ )
++
++replace github.com/charmbracelet/ultraviolet => ../ultraviolet
+diff --color -ruN upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/go.sum third_party/vt/go.sum
+--- upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/go.sum	2026-10-10 15:13:33.342675391 +0400
++++ third_party/vt/go.sum	2026-10-10 15:49:27.606055546 +0400
+@@ -1,9 +1,7 @@
+-github.com/charmbracelet/colorprofile v0.4.2 h1:BdSNuMjRbotnxHSfxy+PCSa4xAmz7szw70ktAtWRYrY=
+-github.com/charmbracelet/colorprofile v0.4.2/go.mod h1:0rTi81QpwDElInthtrQ6Ni7cG0sDtwAd4C4le060fT8=
+-github.com/charmbracelet/ultraviolet v0.0.0-20260303162955-0b88c25f3fff h1:uY7A6hTokHPJBHfq7rj9Y/wm+IAjOghZTxKfVW6QLvw=
+-github.com/charmbracelet/ultraviolet v0.0.0-20260303162955-0b88c25f3fff/go.mod h1:E6/0abq9uG2SnM8IbLB9Y5SW09uIgfaFETk8aRzgXUQ=
+-github.com/charmbracelet/x/ansi v0.11.7 h1:kzv1kJvjg2S3r9KHo8hDdHFQLEqn4RBCb39dAYC84jI=
+-github.com/charmbracelet/x/ansi v0.11.7/go.mod h1:9qGpnAVYz+8ACONkZBUWPtL7lulP9No6p1epAihUZwQ=
++github.com/charmbracelet/colorprofile v0.4.3 h1:QPa1IWkYI+AOB+fE+mg/5/4HRMZcaXex9t5KX76i20Q=
++github.com/charmbracelet/colorprofile v0.4.3/go.mod h1:/zT4BhpD5aGFpqQQqw7a+VtHCzu+zrQtt1zhMt9mR4Q=
++github.com/charmbracelet/x/ansi v0.11.9 h1:kIrqLBxtTVbLyyHO2Evoi93EjQo1mylWmpNEsfPxXAM=
++github.com/charmbracelet/x/ansi v0.11.9/go.mod h1:DG/hpOnaI2QJ/KMMqLL2h0KVhluuJLazf8973P+Vy5w=
+ github.com/charmbracelet/x/exp/ordered v0.1.0 h1:55/qLwjIh0gL0Vni+QAWk7T/qRVP6sBf+2agPBgnOFE=
+ github.com/charmbracelet/x/exp/ordered v0.1.0/go.mod h1:5UHwmG+is5THxMyCJHNPCn2/ecI07aKNrW+LcResjJ8=
+ github.com/charmbracelet/x/term v0.2.2 h1:xVRT/S2ZcKdhhOuSP4t5cLi5o+JxklsoEObBSgfgZRk=
+@@ -16,19 +14,19 @@
+ github.com/clipperhouse/displaywidth v0.11.0/go.mod h1:bkrFNkf81G8HyVqmKGxsPufD3JhNl3dSqnGhOoSD/o0=
+ github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJv2v7Vk=
+ github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
+-github.com/lucasb-eyer/go-colorful v1.4.0 h1:UtrWVfLdarDgc44HcS7pYloGHJUjHV/4FwW4TvVgFr4=
+-github.com/lucasb-eyer/go-colorful v1.4.0/go.mod h1:R4dSotOR9KMtayYi1e77YzuveK+i7ruzyGqttikkLy0=
+-github.com/mattn/go-runewidth v0.0.23 h1:7ykA0T0jkPpzSvMS5i9uoNn2Xy3R383f9HDx3RybWcw=
+-github.com/mattn/go-runewidth v0.0.23/go.mod h1:XBkDxAl56ILZc9knddidhrOlY5R/pDhgLpndooCuJAs=
++github.com/lucasb-eyer/go-colorful v1.4.1 h1:1EO+WB73+EH8EVbzlrG3KLAfEypQWVHIBqlTf+2hNss=
++github.com/lucasb-eyer/go-colorful v1.4.1/go.mod h1:R4dSotOR9KMtayYi1e77YzuveK+i7ruzyGqttikkLy0=
++github.com/mattn/go-runewidth v0.0.30 h1:+KUuiDA4fF0R1p5FeueHefjDm+GIM+kWfFnDjybOPgk=
++github.com/mattn/go-runewidth v0.0.30/go.mod h1:3qAiGCV4Koz/yuveO58qUefmUTRm8r0IGEXZ9jeHp/8=
+ github.com/muesli/cancelreader v0.2.2 h1:3I4Kt4BQjOR54NavqnDogx/MIoWBFa0StPA8ELUXHmA=
+ github.com/muesli/cancelreader v0.2.2/go.mod h1:3XuTXfFS2VjM+HTLZY9Ak0l6eUKfijIfMUZ4EgX0QYo=
+ github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
+ github.com/rivo/uniseg v0.4.7/go.mod h1:FN3SvrM+Zdj16jyLfmOkMNblXMcoc8DfTHruCPUcx88=
+-github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e h1:JVG44RsyaB9T2KIHavMF/ppJZNG9ZpyihvCd0w101no=
+-github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
++github.com/xo/terminfo v1.0.0 h1:2ZpYzqWzyyytjk3TP6aJVDhkMAkc99/1xKQdA3TDTBY=
++github.com/xo/terminfo v1.0.0/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
+ golang.org/x/exp v0.0.0-20231006140011-7918f672742d h1:jtJma62tbqLibJ5sFQz8bKtEM8rJBtfilJ2qTU199MI=
+ golang.org/x/exp v0.0.0-20231006140011-7918f672742d/go.mod h1:ldy0pHrwJyGW56pPQzzkH36rKxoZW1tw7ZJpeKx+hdo=
+-golang.org/x/sync v0.19.0 h1:vV+1eWNmZ5geRlYjzm2adRgW2/mcpevXNg50YZtPCE4=
+-golang.org/x/sync v0.19.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=
+-golang.org/x/sys v0.41.0 h1:Ivj+2Cp/ylzLiEU89QhWblYnOE9zerudt9Ftecq2C6k=
+-golang.org/x/sys v0.41.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
++golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=
++golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
++golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
++golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+diff --color -ruN upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/pangea.go third_party/vt/pangea.go
+--- upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/pangea.go	1970-01-01 04:00:00.000000000 +0400
++++ third_party/vt/pangea.go	2026-10-10 16:33:08.115862766 +0400
+@@ -0,0 +1,43 @@
++package vt
++
++import "github.com/charmbracelet/x/ansi"
++
++// pangea fork additions.
++
++// MouseTracking reports whether the application enabled any mouse mode.
++func (e *Emulator) MouseTracking() bool {
++	for _, m := range []ansi.DECMode{ansi.ModeMouseX10, ansi.ModeMouseNormal,
++		ansi.ModeMouseHighlight, ansi.ModeMouseButtonEvent, ansi.ModeMouseAnyEvent} {
++		if e.isModeSet(m) {
++			return true
++		}
++	}
++	return false
++}
++
++// CursorVisible reports whether the application shows the cursor.
++func (e *Emulator) CursorVisible() bool { return !e.scr.cur.Hidden }
++
++func (se *SafeEmulator) MouseTracking() bool {
++	se.mu.RLock()
++	defer se.mu.RUnlock()
++	return se.Emulator.MouseTracking()
++}
++
++func (se *SafeEmulator) CursorVisible() bool {
++	se.mu.RLock()
++	defer se.mu.RUnlock()
++	return se.Emulator.CursorVisible()
++}
++
++// ScrollbackRange copies rendered scrollback lines [from, to) under the lock.
++func (se *SafeEmulator) ScrollbackRange(from, to int) []string {
++	se.mu.RLock()
++	defer se.mu.RUnlock()
++	sb := se.Emulator.Scrollback()
++	from, to = max(0, from), min(to, sb.Len())
++	if from >= to {
++		return nil
++	}
++	return append([]string(nil), sb.Lines()[from:to]...)
++}
+diff --color -ruN upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/safe_emulator.go third_party/vt/safe_emulator.go
+--- upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/safe_emulator.go	2026-10-10 15:13:33.343526616 +0400
++++ third_party/vt/safe_emulator.go	2026-10-10 16:23:28.412990132 +0400
+@@ -195,12 +195,6 @@
+ 	return se.Emulator.ScrollbackLen()
+ }
+ 
+-// ScrollbackCellAt returns a cell from the scrollback buffer in a concurrency-safe manner.
+-func (se *SafeEmulator) ScrollbackCellAt(x, y int) *uv.Cell {
+-	se.mu.RLock()
+-	defer se.mu.RUnlock()
+-	return se.Emulator.ScrollbackCellAt(x, y)
+-}
+ 
+ // SetScrollbackSize sets the scrollback buffer size in a concurrency-safe manner.
+ func (se *SafeEmulator) SetScrollbackSize(maxLines int) {
+diff --color -ruN upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/scrollback.go third_party/vt/scrollback.go
+--- upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/scrollback.go	2026-10-10 15:13:33.343817882 +0400
++++ third_party/vt/scrollback.go	2026-10-10 16:33:08.116180762 +0400
+@@ -1,8 +1,6 @@
+ package vt
+ 
+ import (
+-	"slices"
+-
+ 	uv "github.com/charmbracelet/ultraviolet"
+ )
+ 
+@@ -11,7 +9,10 @@
+ 
+ // Scrollback represents a scrollback buffer that stores lines scrolled off the screen.
+ type Scrollback struct {
+-	lines    []uv.Line
++	// pangea fork: lines are kept rendered (ANSI string) instead of as
++	// []uv.Cell. That is ~100x smaller and leaves the GC one pointer per
++	// line to scan instead of several per cell.
++	lines    []string
+ 	maxLines int
+ }
+ 
+@@ -21,7 +22,7 @@
+ 		maxLines = DefaultScrollbackSize
+ 	}
+ 	return &Scrollback{
+-		lines:    make([]uv.Line, 0, min(maxLines, 1000)), // Pre-allocate reasonable capacity
++		lines:    make([]string, 0, min(maxLines, 1000)), // Pre-allocate reasonable capacity
+ 		maxLines: maxLines,
+ 	}
+ }
+@@ -44,14 +45,16 @@
+ 		}
+ 	}
+ 
+-	// Clone the line content up to and including the last non-empty cell
+-	cloned := slices.Clone(line[:lastNonEmpty+1])
++	rendered := line[:lastNonEmpty+1].Render()
+ 
+ 	if len(s.lines) >= s.maxLines {
+ 		// Remove oldest line and append new one
+-		s.lines = slices.Delete(s.lines, 0, 1)
++		// Reslice instead of shifting: append reallocates (copying only
++		// live lines) when capacity runs out, so pushes are amortised O(1).
++		s.lines[0] = ""
++		s.lines = s.lines[1:]
+ 	}
+-	s.lines = append(s.lines, cloned)
++	s.lines = append(s.lines, rendered)
+ }
+ 
+ // PushN adds n lines from the buffer starting at line y to the scrollback.
+@@ -97,19 +100,19 @@
+ 	}
+ }
+ 
+-// Line returns the line at the given index.
++// Line returns the rendered line at the given index.
+ // Index 0 is the oldest line, Len()-1 is the most recent.
+-// Returns nil if index is out of bounds.
+-func (s *Scrollback) Line(index int) uv.Line {
++// Returns "" if index is out of bounds.
++func (s *Scrollback) Line(index int) string {
+ 	if s == nil || index < 0 || index >= len(s.lines) {
+-		return nil
++		return ""
+ 	}
+ 	return s.lines[index]
+ }
+ 
+-// Lines returns all lines in the scrollback buffer.
++// Lines returns all rendered lines in the scrollback buffer.
+ // Index 0 is the oldest line.
+-func (s *Scrollback) Lines() []uv.Line {
++func (s *Scrollback) Lines() []string {
+ 	if s == nil {
+ 		return nil
+ 	}
+@@ -124,13 +127,3 @@
+ 	s.lines = s.lines[:0]
+ }
+ 
+-// CellAt returns the cell at the given position in the scrollback buffer.
+-// x is the column, y is the line index (0 = oldest).
+-// Returns nil if position is out of bounds.
+-func (s *Scrollback) CellAt(x, y int) *uv.Cell {
+-	line := s.Line(y)
+-	if line == nil || x < 0 || x >= len(line) {
+-		return nil
+-	}
+-	return &line[x]
+-}
+diff --color -ruN upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/terminal.go third_party/vt/terminal.go
+--- upstream/x/vt@v0.0.0-20261008172826-faa4adf95555/terminal.go	2026-10-10 15:13:33.344008167 +0400
++++ third_party/vt/terminal.go	2026-10-10 16:23:28.413035064 +0400
+@@ -36,7 +36,6 @@
+ 	Render() string
+ 	Resize(width int, height int)
+ 	Scrollback() *Scrollback
+-	ScrollbackCellAt(x, y int) *uv.Cell
+ 	ScrollbackLen() int
+ 	SendKey(k uv.KeyEvent)
+ 	SendKeys(keys ...uv.KeyEvent)
